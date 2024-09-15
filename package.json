@@ -128,6 +128,9 @@
     "zod-to-json-schema": "^3.23.3"
   },
   "dependencies": {
+    "@adaline/gateway": "^0.13.0",
+    "@adaline/openai": "^0.11.0",
+    "@adaline/types": "^0.8.0",
     "@anthropic-ai/sdk": "^0.27.3",
     "@apidevtools/json-schema-ref-parser": "^11.7.0",
     "@googleapis/sheets": "^9.3.1",
