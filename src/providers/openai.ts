@@ -1,5 +1,9 @@
 import type { Cache } from 'cache-manager';
 import OpenAI from 'openai';
+import { OpenAI as GatewayOpenAI } from "@adaline/openai";
+import { Gateway } from '@adaline/gateway';
+import type { CompleteChatHandlerResponseType, GetEmbeddingsHandlerResponseType } from "@adaline/gateway";
+
 import { fetchWithCache, getCache, isCacheEnabled } from '../cache';
 import { getEnvString, getEnvFloat, getEnvInt } from '../envars';
 import logger from '../logger';
@@ -280,33 +284,44 @@ export class OpenAiEmbeddingProvider extends OpenAiGenericProvider {
       throw new Error('OpenAI API key must be set for similarity comparison');
     }
 
-    const body = {
-      input: text,
-      model: this.modelName,
-    };
-    let data,
-      cached = false;
-    try {
-      ({ data, cached } = (await fetchWithCache(
-        `${this.getApiUrl()}/embeddings`,
-        {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            Authorization: `Bearer ${this.getApiKey()}`,
-            ...(this.getOrganization() ? { 'OpenAI-Organization': this.getOrganization() } : {}),
-            ...this.config.headers,
-          },
-          body: JSON.stringify(body),
-        },
-        REQUEST_TIMEOUT_MS,
-      )) as unknown as any);
-    } catch (err) {
-      logger.error(`API call error: ${err}`);
-      throw err;
-    }
-    logger.debug(`\tOpenAI embeddings API response: ${JSON.stringify(data)}`);
+    let useGateway = true;
+    let data, cached = false;
 
+    if (useGateway) {
+      try {
+        ({ data, cached } = await this.callEmbeddingApiGateway(text));
+      } catch (err) {
+        useGateway = false; // fallback to calling OpenAI API directly
+      }
+    }
+
+    if (!useGateway) {
+      const body = {
+        input: text,
+        model: this.modelName,
+      };
+      try {
+        ({ data, cached } = (await fetchWithCache(
+          `${this.getApiUrl()}/embeddings`,
+          {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              Authorization: `Bearer ${this.getApiKey()}`,
+              ...(this.getOrganization() ? { 'OpenAI-Organization': this.getOrganization() } : {}),
+              ...this.config.headers,
+            },
+            body: JSON.stringify(body),
+          },
+          REQUEST_TIMEOUT_MS,
+        )) as unknown as any);
+      } catch (err) {
+        logger.error(`API call error: ${err}`);
+        throw err;
+      }
+      logger.debug(`\tOpenAI embeddings API response: ${JSON.stringify(data)}`);
+    }
+    
     try {
       const embedding = data?.data?.[0]?.embedding;
       if (!embedding) {
@@ -319,6 +334,61 @@ export class OpenAiEmbeddingProvider extends OpenAiGenericProvider {
     } catch (err) {
       logger.error(data.error.message);
       throw err;
+    }
+  }
+
+  async callEmbeddingApiGateway(text: string): Promise<{ data: any; cached: boolean; }> {
+    try {
+      const gatewayOpenAi = new GatewayOpenAI();
+      if (!(gatewayOpenAi.embeddingModelLiterals().includes(this.modelName))) {
+        throw new Error(`Unsupported Gateway OpenAI embedding model: ${this.modelName}`);
+      }
+
+      const modelRequest = {
+        input: text,
+      };
+
+      const gatewayModel = gatewayOpenAi.embeddingModel(this.modelName, {
+        apiKey: this.getApiKey(),
+        baseURL: this.getApiUrl(),
+        organization: this.getOrganization(),
+      });
+
+      const _gatewayRequest = gatewayModel.transformModelRequest(modelRequest);
+      const gatewayRequest = {
+        model: gatewayModel,
+        config: _gatewayRequest.config,
+        embeddingRequests: _gatewayRequest.embeddingRequests,
+        options: { 
+          enableCache: isCacheEnabled(),
+          customHeaders: this.config.headers,
+        },
+      };
+
+      // Note: callEmbeddingApi() is only invoked sequentially throughout PromptFoo,  
+      //       so instantiating a new Gateway object here is fine. 
+      //       When parallelizing this, Gateway object can be re-used via the 
+      //       Evaluator -> assertions -> matchers -> ... -> callEmbeddingApi()
+      const gateway = new Gateway({
+        queueOptions: {
+          maxConcurrentTasks: 1,
+          retryCount: 4,
+          retry: {
+            initialDelay: getEnvInt('PROMPTFOO_REQUEST_BACKOFF_MS', 5000),
+            exponentialFactor: 2,
+          },
+          timeout: REQUEST_TIMEOUT_MS, 
+        },
+      });
+      logger.debug(`Calling OpenAI Embeddings API via Gateway: ${JSON.stringify(gatewayRequest)}`);
+      const response = await gateway.getEmbeddings(gatewayRequest) as GetEmbeddingsHandlerResponseType;
+      logger.debug(`OpenAI Embeddings API via Gateway response: ${JSON.stringify(response)}`);
+      const gatewayResponse = response.provider.response.data;
+
+      return { data: gatewayResponse, cached: response.cached };
+    } catch (err) {
+      logger.error(`Error calling OpenAI Embeddings API via Gateway: ${err}`);
+      throw new Error(`Error calling OpenAI Embeddings API via Gateway: ${err}`);
     }
   }
 }
@@ -492,82 +562,108 @@ export class OpenAiChatCompletionProvider extends OpenAiGenericProvider {
       );
     }
 
-    const messages = parseChatPrompt(prompt, [{ role: 'user', content: prompt }]);
+    let useGateway = context?.gateway ? true : false;
+    let data, cached = false;
+    const functionCalls = (this.config.functions
+      ? {
+          functions: maybeLoadFromExternalFile(
+            renderVarsInObject(this.config.functions, context?.vars),
+          ),
+        }
+      : {});
+    const passthrough = this.config.passthrough || {};
 
-    // NOTE: Special handling for o1 models which do not support max_tokens and temperature
-    const isO1Model = this.modelName.startsWith('o1-');
-    const maxCompletionTokens = isO1Model
-      ? (this.config.max_completion_tokens ?? getEnvInt('OPENAI_MAX_COMPLETION_TOKENS', 1024))
-      : undefined;
-    const maxTokens = isO1Model
-      ? undefined
-      : (this.config.max_tokens ?? getEnvInt('OPENAI_MAX_TOKENS', 1024));
-    const temperature = isO1Model
-      ? undefined
-      : (this.config.temperature ?? getEnvFloat('OPENAI_TEMPERATURE', 0));
+    if (Object.keys(functionCalls).length > 0 || Object.keys(passthrough).length > 0) {
+      // Gateway doesn't support OpenAI functions (on path to deprecation)
+      // Gateway doesn't support passthrough items to body
+      useGateway = false;
+    }
 
-    const body = {
-      model: this.modelName,
-      messages,
-      seed: this.config.seed,
-      ...(maxTokens ? { max_tokens: maxTokens } : {}),
-      ...(maxCompletionTokens ? { max_completion_tokens: maxCompletionTokens } : {}),
-      ...(temperature ? { temperature } : {}),
-      top_p: this.config.top_p ?? Number.parseFloat(process.env.OPENAI_TOP_P || '1'),
-      presence_penalty:
-        this.config.presence_penalty ??
-        Number.parseFloat(process.env.OPENAI_PRESENCE_PENALTY || '0'),
-      frequency_penalty:
-        this.config.frequency_penalty ??
-        Number.parseFloat(process.env.OPENAI_FREQUENCY_PENALTY || '0'),
-      ...(this.config.functions
-        ? {
-            functions: maybeLoadFromExternalFile(
-              renderVarsInObject(this.config.functions, context?.vars),
-            ),
-          }
-        : {}),
-      ...(this.config.function_call ? { function_call: this.config.function_call } : {}),
-      ...(this.config.tools
-        ? { tools: maybeLoadFromExternalFile(renderVarsInObject(this.config.tools, context?.vars)) }
-        : {}),
-      ...(this.config.tool_choice ? { tool_choice: this.config.tool_choice } : {}),
-      ...(this.config.response_format ? { response_format: this.config.response_format } : {}),
-      ...(callApiOptions?.includeLogProbs ? { logprobs: callApiOptions.includeLogProbs } : {}),
-      ...(this.config.stop ? { stop: this.config.stop } : {}),
-      ...(this.config.passthrough || {}),
-    };
-    logger.debug(`Calling OpenAI API: ${JSON.stringify(body)}`);
+    if (useGateway) {
+      try {
+        ({ data, cached } = await this.callApiGateway(prompt, context, callApiOptions));
+      } catch (err) {
+        useGateway = false; // fallback to calling OpenAI API directly
+      }
+    }
 
-    let data,
-      cached = false;
-    try {
-      ({ data, cached } = (await fetchWithCache(
-        `${this.getApiUrl()}/chat/completions`,
-        {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            Authorization: `Bearer ${this.getApiKey()}`,
-            ...(this.getOrganization() ? { 'OpenAI-Organization': this.getOrganization() } : {}),
-            ...this.config.headers,
+    if (!useGateway) {
+      const messages = parseChatPrompt(prompt, [{ role: 'user', content: prompt }]);
+
+      // NOTE: Special handling for o1 models which do not support max_tokens and temperature
+      const isO1Model = this.modelName.startsWith('o1-');
+      const maxCompletionTokens = isO1Model
+        ? (this.config.max_completion_tokens ?? getEnvInt('OPENAI_MAX_COMPLETION_TOKENS', 1024))
+        : undefined;
+      const maxTokens = isO1Model
+        ? undefined
+        : (this.config.max_tokens ?? getEnvInt('OPENAI_MAX_TOKENS', 1024));
+      const temperature = isO1Model
+        ? undefined
+        : (this.config.temperature ?? getEnvFloat('OPENAI_TEMPERATURE', 0));
+
+      const body = {
+        model: this.modelName,
+        messages,
+        seed: this.config.seed,
+        ...(maxTokens ? { max_tokens: maxTokens } : {}),
+        ...(maxCompletionTokens ? { max_completion_tokens: maxCompletionTokens } : {}),
+        ...(temperature ? { temperature } : {}),
+        top_p: this.config.top_p ?? Number.parseFloat(process.env.OPENAI_TOP_P || '1'),
+        presence_penalty:
+          this.config.presence_penalty ??
+          Number.parseFloat(process.env.OPENAI_PRESENCE_PENALTY || '0'),
+        frequency_penalty:
+          this.config.frequency_penalty ??
+          Number.parseFloat(process.env.OPENAI_FREQUENCY_PENALTY || '0'),
+        ...(this.config.functions
+          ? {
+              functions: maybeLoadFromExternalFile(
+                renderVarsInObject(this.config.functions, context?.vars),
+              ),
+            }
+          : {}),
+        ...(this.config.function_call ? { function_call: this.config.function_call } : {}),
+        ...(this.config.tools
+          ? { tools: maybeLoadFromExternalFile(renderVarsInObject(this.config.tools, context?.vars)) }
+          : {}),
+        ...(this.config.tool_choice ? { tool_choice: this.config.tool_choice } : {}),
+        ...(this.config.response_format ? { response_format: this.config.response_format } : {}),
+        ...(callApiOptions?.includeLogProbs ? { logprobs: callApiOptions.includeLogProbs } : {}),
+        ...(this.config.stop ? { stop: this.config.stop } : {}),
+        ...(this.config.passthrough || {}),
+      };
+      logger.debug(`Calling OpenAI API: ${JSON.stringify(body)}`);
+
+      try {
+        ({ data, cached } = (await fetchWithCache(
+          `${this.getApiUrl()}/chat/completions`,
+          {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              Authorization: `Bearer ${this.getApiKey()}`,
+              ...(this.getOrganization() ? { 'OpenAI-Organization': this.getOrganization() } : {}),
+              ...this.config.headers,
+            },
+            body: JSON.stringify(body),
           },
-          body: JSON.stringify(body),
-        },
-        REQUEST_TIMEOUT_MS,
-      )) as unknown as { data: any; cached: boolean });
-    } catch (err) {
-      return {
-        error: `API call error: ${String(err)}`,
-      };
+          REQUEST_TIMEOUT_MS,
+        )) as unknown as { data: any; cached: boolean });
+      } catch (err) {
+        return {
+          error: `API call error: ${String(err)}`,
+        };
+      }
+
+      logger.debug(`\tOpenAI chat completions API response: ${JSON.stringify(data)}`);
+      if (data.error) {
+        return {
+          error: formatOpenAiError(data),
+        };
+      }
     }
 
-    logger.debug(`\tOpenAI chat completions API response: ${JSON.stringify(data)}`);
-    if (data.error) {
-      return {
-        error: formatOpenAiError(data),
-      };
-    }
     try {
       const message = data.choices[0].message;
       if (message.refusal) {
@@ -647,6 +743,73 @@ export class OpenAiChatCompletionProvider extends OpenAiGenericProvider {
       return {
         error: `API error: ${String(err)}: ${JSON.stringify(data)}`,
       };
+    }
+  }
+
+  async callApiGateway(
+    prompt: string,
+    context?: CallApiContextParams,
+    callApiOptions?: CallApiOptionsParams,
+  ): Promise<{ data: any; cached: boolean }> {
+    try {
+      const gatewayOpenAi = new GatewayOpenAI();
+      if (!(gatewayOpenAi.chatModelLiterals().includes(this.modelName))) {
+        throw new Error(`Unsupported Gateway OpenAI chat model: ${this.modelName}`);
+      }
+
+      const gatewayModel = gatewayOpenAi.chatModel(this.modelName, { 
+        apiKey: this.getApiKey(), 
+        baseURL: this.getApiUrl(),
+        organization: this.getOrganization(),
+      });
+
+      const modelRequest = {
+        // config fields
+        seed: 
+          this.config.seed,
+        max_tokens: 
+          this.config.max_tokens ?? Number.parseInt(process.env.OPENAI_MAX_TOKENS || '1024'),
+        temperature: 
+          this.config.temperature ?? Number.parseFloat(process.env.OPENAI_TEMPERATURE || '0'),
+        top_p: 
+          this.config.top_p ?? Number.parseFloat(process.env.OPENAI_TOP_P || '1'),
+        presence_penalty:
+          this.config.presence_penalty ?? Number.parseFloat(process.env.OPENAI_PRESENCE_PENALTY || '0'),
+        frequency_penalty:
+          this.config.frequency_penalty ?? Number.parseFloat(process.env.OPENAI_FREQUENCY_PENALTY || '0'),
+        ...(this.config.stop ? { stop: this.config.stop } : {}),
+        ...(callApiOptions?.includeLogProbs ? { logprobs: callApiOptions.includeLogProbs } : {}),
+        ...(this.config.tool_choice ? { tool_choice: this.config.tool_choice } : {}),
+        ...(this.config.response_format ? { response_format: this.config.response_format } : {}),
+        // messages
+        messages: parseChatPrompt(prompt, [{ role: 'user', content: prompt }]),
+        // tools
+        ...(this.config.tools 
+          ? { tools: maybeLoadFromExternalFile(renderVarsInObject(this.config.tools, context?.vars)) }
+          : {})
+      };
+      
+      const _gatewayRequest = gatewayModel.transformModelRequest(modelRequest);
+      const gatewayRequest = {
+        model: gatewayModel,
+        config: _gatewayRequest.config,
+        messages: _gatewayRequest.messages,
+        tools: _gatewayRequest.tools,
+        options: { 
+          enableCache: isCacheEnabled(),
+          customHeaders: this.config.headers,
+        },
+      };
+
+      logger.debug(`Calling OpenAI Chat Completion via Gateway: ${JSON.stringify(gatewayRequest)}`);
+      const response = await context?.gateway?.completeChat(gatewayRequest) as CompleteChatHandlerResponseType;
+      logger.debug(`OpenAI Chat Completion via Gateway response: ${JSON.stringify(response)}`);
+      const gatewayResponse = response.provider.response.data;
+
+      return { data: gatewayResponse, cached: response.cached };
+    } catch (err) {
+      logger.debug(`Error calling OpenAI Chat Completion via Gateway: ${err}`);
+      throw new Error(`Error calling OpenAI Chat Completion via Gateway: ${err}`);
     }
   }
 }
