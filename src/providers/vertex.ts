@@ -1,7 +1,14 @@
 import Clone from 'rfdc';
+import { Gateway } from '@adaline/gateway';
+import type {
+  CompleteChatHandlerResponseType,
+  GetEmbeddingsHandlerResponseType,
+} from '@adaline/gateway';
+import { Vertex as GatewayVertex } from '@adaline/vertex';
+
 import { getCache, isCacheEnabled } from '../cache';
 import cliState from '../cliState';
-import { getEnvString } from '../envars';
+import { getEnvString, getEnvInt } from '../envars';
 import logger from '../logger';
 import type {
   ApiEmbeddingProvider,
@@ -215,6 +222,8 @@ export class VertexChatProvider extends VertexGenericProvider {
     return this.callPalm2Api(prompt);
   }
 
+  // TODO: remove all console.logs
+  // TODO: add all logger.debug
   async callGeminiApi(prompt: string, context?: CallApiContextParams): Promise<ProviderResponse> {
     // https://cloud.google.com/vertex-ai/docs/generative-ai/model-reference/gemini#gemini-pro
     let contents = parseChatPrompt(prompt, {
@@ -262,59 +271,75 @@ export class VertexChatProvider extends VertexGenericProvider {
     };
     logger.debug(`Preparing to call Google Vertex API (Gemini) with body: ${JSON.stringify(body)}`);
 
-    const cache = await getCache();
-    const cacheKey = `vertex:gemini:${JSON.stringify(body)}`;
+    let data,
+      useGateway = context?.gateway ? true : false;
 
-    let cachedResponse;
-    if (isCacheEnabled()) {
-      cachedResponse = await cache.get(cacheKey);
-      if (cachedResponse) {
-        const parsedCachedResponse = JSON.parse(cachedResponse as string);
-        const tokenUsage = parsedCachedResponse.tokenUsage as TokenUsage;
-        if (tokenUsage) {
-          tokenUsage.cached = tokenUsage.total;
-        }
-        logger.debug(`Returning cached response: ${cachedResponse}`);
-        return { ...parsedCachedResponse, cached: true };
+    if (useGateway) {
+      try {
+        console.log('Calling Google AI Studio Chat Completion via Gateway');
+        const { data: gatewayData } = await this.callApiGateway(body, context);
+        data = gatewayData as any;
+        console.log('data', data);
+      } catch (err) {
+        console.log('Error calling Google AI Studio Chat Completion via Gateway: ', err);
+        logger.debug(`Error calling Google AI Studio Chat Completion via Gateway: ${err}`);
+        useGateway = false;
       }
     }
 
-    let data;
-    try {
-      const { client, projectId } = await getGoogleClient();
-      const url = `https://${this.getApiHost()}/v1/projects/${projectId}/locations/${this.getRegion()}/publishers/${this.getPublisher()}/models/${
-        this.modelName
-      }:streamGenerateContent`;
-      const res = await client.request({
-        url,
-        method: 'POST',
-        data: body,
-        timeout: REQUEST_TIMEOUT_MS,
-      });
-      data = res.data as GeminiApiResponse;
-      logger.debug(`Gemini API response: ${JSON.stringify(data)}`);
-    } catch (err) {
-      const geminiError = err as any;
-      logger.debug(
-        `Gemini API error:\nString:\n${String(geminiError)}\nJSON:\n${JSON.stringify(geminiError)}]`,
-      );
-      if (
-        geminiError.response &&
-        geminiError.response.data &&
-        geminiError.response.data[0] &&
-        geminiError.response.data[0].error
-      ) {
-        const errorDetails = geminiError.response.data[0].error;
-        const code = errorDetails.code;
-        const message = errorDetails.message;
-        const status = errorDetails.status;
+    const cache = await getCache();
+    const cacheKey = `vertex:gemini:${JSON.stringify(body)}`;
+    if (!useGateway) {
+      let cachedResponse;
+      if (isCacheEnabled()) {
+        cachedResponse = await cache.get(cacheKey);
+        if (cachedResponse) {
+          const parsedCachedResponse = JSON.parse(cachedResponse as string);
+          const tokenUsage = parsedCachedResponse.tokenUsage as TokenUsage;
+          if (tokenUsage) {
+            tokenUsage.cached = tokenUsage.total;
+          }
+          logger.debug(`Returning cached response: ${cachedResponse}`);
+          return { ...parsedCachedResponse, cached: true };
+        }
+      }
+
+      try {
+        const { client, projectId } = await getGoogleClient();
+        const url = `https://${this.getApiHost()}/v1/projects/${projectId}/locations/${this.getRegion()}/publishers/${this.getPublisher()}/models/${
+          this.modelName
+        }:streamGenerateContent`;
+        const res = await client.request({
+          url,
+          method: 'POST',
+          data: body,
+          timeout: REQUEST_TIMEOUT_MS,
+        });
+        data = res.data as GeminiApiResponse;
+        logger.debug(`Gemini API response: ${JSON.stringify(data)}`);
+      } catch (err) {
+        const geminiError = err as any;
+        logger.debug(
+          `Gemini API error:\nString:\n${String(geminiError)}\nJSON:\n${JSON.stringify(geminiError)}]`,
+        );
+        if (
+          geminiError.response &&
+          geminiError.response.data &&
+          geminiError.response.data[0] &&
+          geminiError.response.data[0].error
+        ) {
+          const errorDetails = geminiError.response.data[0].error;
+          const code = errorDetails.code;
+          const message = errorDetails.message;
+          const status = errorDetails.status;
+          return {
+            error: `API call error: Status ${status}, Code ${code}, Message:\n\n${message}`,
+          };
+        }
         return {
-          error: `API call error: Status ${status}, Code ${code}, Message:\n\n${message}`,
+          error: `API call error: ${String(err)}`,
         };
       }
-      return {
-        error: `API call error: ${String(err)}`,
-      };
     }
 
     logger.debug(`Gemini API response: ${JSON.stringify(data)}`);
@@ -379,7 +404,7 @@ export class VertexChatProvider extends VertexGenericProvider {
         tokenUsage,
       };
 
-      if (isCacheEnabled()) {
+      if (isCacheEnabled() && !useGateway) {
         await cache.set(cacheKey, JSON.stringify(response));
       }
 
@@ -388,6 +413,54 @@ export class VertexChatProvider extends VertexGenericProvider {
       return {
         error: `Gemini API response error: ${String(err)}. Response data: ${JSON.stringify(data)}`,
       };
+    }
+  }
+
+  async callApiGateway(
+    body: any,
+    context?: CallApiContextParams,
+  ): Promise<{ data: ProviderResponse; cached: boolean }> {
+    try {
+      const gatewayVertex = new GatewayVertex();
+      if (!gatewayVertex.chatModelLiterals().includes(this.modelName)) {
+        throw new Error(`Unsupported Gateway Vertex chat model: ${this.modelName}`);
+      }
+
+      async function fetchAccessToken() {
+        const { client } = await getGoogleClient();
+        const token = await client.getAccessToken();
+        return token.token;
+      }
+
+      const apiKey = this.getApiKey() ? this.getApiKey() : await fetchAccessToken();
+      const gatewayModel = gatewayVertex.chatModel({
+        modelName: this.modelName,
+        accessToken: apiKey as string,
+        location: this.getRegion(),
+        projectId: await this.getProjectId(),
+        publisher: this.getPublisher(),
+      });
+
+      // TODO: delete tool config if no tools are present, test this
+
+      const gatewayRequest = gatewayModel.transformModelRequest(body);
+      logger.debug(`Calling Google Vertex Chat Completion via Gateway: ${JSON.stringify(gatewayRequest)}`);
+      const response = (await context?.gateway?.completeChat({
+        model: gatewayModel,
+        config: gatewayRequest.config,
+        messages: gatewayRequest.messages,
+        tools: gatewayRequest.tools,
+        options: {
+          enableCache: isCacheEnabled(),
+        },
+      })) as CompleteChatHandlerResponseType;
+      logger.debug(`Google Vertex Chat Completion via Gateway response: ${JSON.stringify(response)}`);
+      const gatewayResponse = response.provider.response.data;
+
+      return { data: gatewayResponse, cached: response.cached };
+    } catch (err) {
+      logger.debug(`Error calling Google Vertex Chat Completion via Gateway: ${err}`);
+      throw new Error(`Error calling Google Vertex Chat Completion via Gateway: ${err}`);
     }
   }
 
@@ -507,6 +580,8 @@ export class VertexEmbeddingProvider implements ApiEmbeddingProvider {
     throw new Error('Vertex API does not provide text inference.');
   }
 
+  // TODO: remove all console.logs
+  // TODO: add all logger.debug
   async callEmbeddingApi(input: string): Promise<ProviderEmbeddingResponse> {
     // See https://cloud.google.com/vertex-ai/generative-ai/docs/embeddings/get-text-embeddings#get_text_embeddings_for_a_snippet_of_text
     const body = {
@@ -516,23 +591,36 @@ export class VertexEmbeddingProvider implements ApiEmbeddingProvider {
       },
     };
 
-    let data: any;
-    try {
-      const { client, projectId } = await getGoogleClient();
-      const url = `https://${this.getRegion()}-aiplatform.googleapis.com/v1/projects/${projectId}/locations/${this.getRegion()}/publishers/google/models/${
-        this.modelName
-      }:predict`;
-      const res = await client.request<any>({
-        url,
-        method: 'POST',
-        data: body,
-      });
-      data = res.data;
-    } catch (err) {
-      logger.error(`Vertex API call error: ${err}`);
-      throw err;
+    let data: any,
+      useGateway = true;
+    
+    if (useGateway) {
+      try {
+        ({ data } = await this.callEmbeddingApiGateway(body));
+      } catch (err) {
+        console.log('Error calling Google Vertex embeddings API via Gateway: ', err);
+        logger.debug(`Error calling Google Vertex embeddings API via Gateway: ${err}`);
+        useGateway = false;
+      }
     }
 
+    if (!useGateway) {
+      try {
+        const { client, projectId } = await getGoogleClient();
+        const url = `https://${this.getRegion()}-aiplatform.googleapis.com/v1/projects/${projectId}/locations/${this.getRegion()}/publishers/google/models/${
+          this.modelName
+        }:predict`;
+        const res = await client.request<any>({
+          url,
+          method: 'POST',
+          data: body,
+        });
+        data = res.data;
+      } catch (err) {
+        logger.error(`Vertex API call error: ${err}`);
+        throw err;
+      }
+    }
     logger.debug(`Vertex embeddings API response: ${JSON.stringify(data)}`);
 
     try {
@@ -547,6 +635,57 @@ export class VertexEmbeddingProvider implements ApiEmbeddingProvider {
     } catch (err) {
       logger.error(`Error parsing Vertex embeddings API response: ${err}`);
       throw err;
+    }
+  }
+
+  async callEmbeddingApiGateway(body: any): Promise<{ data: ProviderEmbeddingResponse; cached: boolean }> {
+    try {
+      const gatewayVertex = new GatewayVertex();
+      if (!gatewayVertex.embeddingModelLiterals().includes(this.modelName)) {
+        throw new Error(`Unsupported Gateway Google Vertex embedding model: ${this.modelName}`);
+      }
+
+      async function fetchAccessTokenAndProjectId() {
+        const { client, projectId } = await getGoogleClient();
+        const token = await client.getAccessToken();
+        return { token: token.token, projectId };
+      }
+
+      const { token, projectId } = await fetchAccessTokenAndProjectId();
+      const gatewayModel = gatewayVertex.embeddingModel({
+        modelName: this.modelName,
+        accessToken: token as string,
+        location: this.getRegion(),
+        projectId,
+      });
+
+      const _gatewayRequest = gatewayModel.transformModelRequest(body);
+      const gateway = new Gateway({
+        queueOptions: {
+          maxConcurrentTasks: 1,
+          retryCount: 4,
+          retry: {
+            initialDelay: getEnvInt('PROMPTFOO_REQUEST_BACKOFF_MS', 5000),
+            exponentialFactor: 2,
+          },
+          timeout: REQUEST_TIMEOUT_MS,
+        },
+      });
+      const response = (await gateway.getEmbeddings({
+        model: gatewayModel,
+        config: _gatewayRequest.config,
+        embeddingRequests: _gatewayRequest.embeddingRequests,
+        options: {
+          enableCache: isCacheEnabled(),
+          customHeaders: this.config.headers,
+        },
+      })) as GetEmbeddingsHandlerResponseType;
+      logger.debug(`Google Vertex embeddings API via Gateway response: ${JSON.stringify(response)}`);
+      const gatewayResponse = response.provider.response.data;
+      return { data: gatewayResponse, cached: response.cached };
+    } catch (err) {
+      logger.error(`Error calling Google Vertex embeddings API via Gateway: ${err}`);
+      throw new Error(`Error calling Google Vertex embeddings API via Gateway: ${err}`);
     }
   }
 }

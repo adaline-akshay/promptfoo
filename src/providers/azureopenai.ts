@@ -6,7 +6,14 @@ import type {
   RunStepMessageCreationDetails,
 } from '@azure/openai-assistants';
 import invariant from 'tiny-invariant';
-import { fetchWithCache } from '../cache';
+import { Gateway } from '@adaline/gateway';
+import type {
+  CompleteChatHandlerResponseType,
+  GetEmbeddingsHandlerResponseType,
+} from '@adaline/gateway';
+import { Azure as GatewayAzure } from '@adaline/azure';
+
+import { fetchWithCache, isCacheEnabled } from '../cache';
 import { getEnvString, getEnvFloat, getEnvInt } from '../envars';
 import logger from '../logger';
 import type {
@@ -291,6 +298,8 @@ export class AzureOpenAiGenericProvider implements ApiProvider {
 }
 
 export class AzureOpenAiEmbeddingProvider extends AzureOpenAiGenericProvider {
+  // TODO: remove all console.logs
+  // TODO: add all logger.debug
   async callEmbeddingApi(text: string): Promise<ProviderEmbeddingResponse> {
     const apiKey = await this.getApiKey();
     if (!apiKey) {
@@ -304,32 +313,48 @@ export class AzureOpenAiEmbeddingProvider extends AzureOpenAiGenericProvider {
       input: text,
       model: this.deploymentName,
     };
+
     let data,
-      cached = false;
-    try {
-      ({ data, cached } = (await fetchWithCache(
-        `${this.getApiBaseUrl()}/openai/deployments/${this.deploymentName}/embeddings?api-version=${
-          this.config.apiVersion || '2023-12-01-preview'
-        }`,
-        {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            'api-key': apiKey,
+      cached = false,
+      useGateway = true;
+
+    if (useGateway) {
+      try {
+        ({ data, cached } = await this.callEmbeddingApiGateway(body));
+      } catch (err) {
+        console.log('Error calling Azure Embedding API via Gateway: ', err);
+        logger.debug(`Error calling Azure Embedding API via Gateway: ${err}`);
+        useGateway = false;
+      }
+    }
+      
+
+    if (!useGateway) {
+      try {
+        ({ data, cached } = (await fetchWithCache(
+          `${this.getApiBaseUrl()}/openai/deployments/${this.deploymentName}/embeddings?api-version=${
+            this.config.apiVersion || '2023-12-01-preview'
+          }`,
+          {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              'api-key': apiKey,
+            },
+            body: JSON.stringify(body),
           },
-          body: JSON.stringify(body),
-        },
-        REQUEST_TIMEOUT_MS,
-      )) as unknown as any);
-    } catch (err) {
-      return {
-        error: `API call error: ${String(err)}`,
-        tokenUsage: {
-          total: 0,
-          prompt: 0,
-          completion: 0,
-        },
-      };
+          REQUEST_TIMEOUT_MS,
+        )) as unknown as any);
+      } catch (err) {
+        return {
+          error: `API call error: ${String(err)}`,
+          tokenUsage: {
+            total: 0,
+            prompt: 0,
+            completion: 0,
+          },
+        };
+      }
     }
     logger.debug(`\tAzure OpenAI API response (embeddings): ${JSON.stringify(data)}`);
 
@@ -363,6 +388,52 @@ export class AzureOpenAiEmbeddingProvider extends AzureOpenAiGenericProvider {
               completion: data?.usage?.completion_tokens,
             },
       };
+    }
+  }
+
+  // TODO: remove all console.logs
+  // TODO: add all logger.debug
+  async callEmbeddingApiGateway(body: any): Promise<{ data: ProviderEmbeddingResponse; cached: boolean }> {
+    try {
+      const gatewayAzure = new GatewayAzure();
+      const gatewayModel = gatewayAzure.embeddingModel({
+        deploymentId: this.deploymentName,
+        apiKey: await this.getApiKey() as string,
+        baseUrl: this.getApiBaseUrl(),
+      });
+
+      console.log("body", body);
+      const gatewayRequest = gatewayModel.transformModelRequest(body);
+      console.log("gatewayRequest", gatewayRequest);
+
+      const gateway = new Gateway({
+        queueOptions: {
+          maxConcurrentTasks: 1,
+          retryCount: 4,
+          retry: {
+            initialDelay: getEnvInt('PROMPTFOO_REQUEST_BACKOFF_MS', 5000),
+            exponentialFactor: 2,
+          },
+          timeout: REQUEST_TIMEOUT_MS,
+        },
+      });
+
+      const response = (await gateway.getEmbeddings({
+        model: gatewayModel,
+        config: gatewayRequest.config,
+        embeddingRequests: gatewayRequest.embeddingRequests,
+        options: {
+          enableCache: isCacheEnabled(),
+        }
+      })) as GetEmbeddingsHandlerResponseType;
+      logger.debug(`Azure OpenAI Embeddings API via Gateway response: ${JSON.stringify(response)}`);
+      const gatewayResponse = response.provider.response.data;
+      console.log("gatewayResponse", gatewayResponse);
+
+      return { data: gatewayResponse, cached: response.cached };
+    } catch (err) {
+      logger.debug(`Error calling Azure Embedding API via Gateway: ${err}`);
+      throw new Error(`Error calling Azure Embedding API via Gateway: ${err}`);
     }
   }
 }
@@ -459,6 +530,8 @@ export class AzureOpenAiCompletionProvider extends AzureOpenAiGenericProvider {
 }
 
 export class AzureOpenAiChatCompletionProvider extends AzureOpenAiGenericProvider {
+  // TODO: remove all console.logs
+  // TODO: add all logger.debug
   async callApi(
     prompt: string,
     context?: CallApiContextParams,
@@ -516,34 +589,56 @@ export class AzureOpenAiChatCompletionProvider extends AzureOpenAiGenericProvide
     logger.debug(`Calling Azure OpenAI API: ${JSON.stringify(body)}`);
 
     let data,
-      cached = false;
-    try {
-      const url = this.config.dataSources
-        ? `${this.getApiBaseUrl()}/openai/deployments/${
-            this.deploymentName
-          }/extensions/chat/completions?api-version=${
-            this.config.apiVersion || '2023-12-01-preview'
-          }`
-        : `${this.getApiBaseUrl()}/openai/deployments/${
-            this.deploymentName
-          }/chat/completions?api-version=${this.config.apiVersion || '2023-12-01-preview'}`;
+      cached = false,
+      useGateway = context?.gateway ? true : false;
+    
+    if (body.dataSources || body.function_call || this.config.passthrough) {
+      // Gateway does not support dataSources, function_call, or passthrough
+      useGateway = false;
+    }
+    
+    if (useGateway) {
+      try {
+        console.log('Calling Azure Chat Completion via Gateway');
+        ({ data, cached } = await this.callApiGateway(body, context));
+        console.log('data', data);
+        console.log('cached', cached);
+      } catch (err) {
+        console.log('Error calling Azure Chat Completion via Gateway: ', err);
+        logger.debug(`Error calling Azure Chat Completion via Gateway: ${err}`);
+        useGateway = false;
+      }
+    }
 
-      ({ data, cached } = (await fetchWithCache(
-        url,
-        {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            'api-key': apiKey,
+    if (!useGateway) {
+      try {
+        const url = this.config.dataSources
+          ? `${this.getApiBaseUrl()}/openai/deployments/${
+              this.deploymentName
+            }/extensions/chat/completions?api-version=${
+              this.config.apiVersion || '2023-12-01-preview'
+            }`
+          : `${this.getApiBaseUrl()}/openai/deployments/${
+              this.deploymentName
+            }/chat/completions?api-version=${this.config.apiVersion || '2023-12-01-preview'}`;
+
+        ({ data, cached } = (await fetchWithCache(
+          url,
+          {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              'api-key': apiKey,
+            },
+            body: JSON.stringify(body),
           },
-          body: JSON.stringify(body),
-        },
-        REQUEST_TIMEOUT_MS,
-      )) as unknown as any);
-    } catch (err) {
-      return {
-        error: `API call error: ${String(err)}`,
-      };
+          REQUEST_TIMEOUT_MS,
+        )) as unknown as any);
+      } catch (err) {
+        return {
+          error: `API call error: ${String(err)}`,
+        };
+      }
     }
 
     logger.debug(`\tAzure OpenAI API response: ${JSON.stringify(data)}`);
@@ -591,6 +686,43 @@ export class AzureOpenAiChatCompletionProvider extends AzureOpenAiGenericProvide
       return {
         error: `API response error: ${String(err)}: ${JSON.stringify(data)}`,
       };
+    }
+  }
+
+  // TODO: remove all console.logs
+  // TODO: add all logger.debug
+  async callApiGateway(
+    body: any,
+    context?: CallApiContextParams,
+  ): Promise<{ data: ProviderResponse; cached: boolean }> {
+    try {
+      const gatewayAzure = new GatewayAzure();
+      const gatewayModel = gatewayAzure.chatModel({
+        deploymentId: this.deploymentName,
+        apiKey: await this.getApiKey() as string,
+        baseUrl: this.getApiBaseUrl(),
+      });
+
+      console.log('body', body);
+      const gatewayRequest = gatewayModel.transformModelRequest(body);
+      console.log('gatewayRequest', gatewayRequest);
+
+      console.log(`Calling Azure Chat Completion via Gateway: ${JSON.stringify(gatewayRequest)}`);
+      const response = (await context?.gateway?.completeChat({
+        model: gatewayModel,
+        config: gatewayRequest.config,
+        messages: gatewayRequest.messages,
+        tools: gatewayRequest.tools,
+        options: {
+          enableCache: isCacheEnabled(),
+        },
+      })) as CompleteChatHandlerResponseType;
+      console.log(`Azure Chat Completion via Gateway response: ${JSON.stringify(response)}`);
+      const gatewayResponse = response.provider.response.data;
+      return { data: gatewayResponse, cached: response.cached };
+    } catch (err) {
+      logger.debug(`Error calling Azure Chat Completion via Gateway: ${err}`);
+      throw new Error(`Error calling Azure Chat Completion via Gateway: ${err}`);
     }
   }
 }

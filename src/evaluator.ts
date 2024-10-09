@@ -5,14 +5,18 @@ import { globSync } from 'glob';
 import * as path from 'path';
 import readline from 'readline';
 import invariant from 'tiny-invariant';
+import { Gateway } from '@adaline/gateway';
+
 import { runAssertions, runCompareAssertion } from './assertions';
 import { fetchWithCache, getCache } from './cache';
+import { GatewayCachePlugin } from './cache.gateway';
 import cliState from './cliState';
 import { getEnvBool, getEnvInt, isCI } from './envars';
 import { renderPrompt, runExtensionHook } from './evaluatorHelpers';
 import logger from './logger';
 import { generateIdFromPrompt } from './models/prompt';
 import { maybeEmitAzureOpenAiWarning } from './providers/azureopenaiUtil';
+import { REQUEST_TIMEOUT_MS } from './providers/shared';
 import { generatePrompts } from './suggestions';
 import telemetry from './telemetry';
 import type {
@@ -108,6 +112,7 @@ class Evaluator {
     { prompt: string | object; input: string; output: string | object }[]
   >;
   registers: Record<string, string | object>;
+  gateway: Gateway;
 
   constructor(testSuite: TestSuite, options: EvaluateOptions) {
     this.testSuite = testSuite;
@@ -124,6 +129,19 @@ class Evaluator {
     };
     this.conversations = {};
     this.registers = {};
+    this.gateway = new Gateway({
+      queueOptions: {
+        maxConcurrentTasks: options.maxConcurrency || DEFAULT_MAX_CONCURRENCY,
+        retryCount: 4,
+        retry: {
+          initialDelay: getEnvInt('PROMPTFOO_REQUEST_BACKOFF_MS', 5000),
+          exponentialFactor: 2,
+        },
+        timeout: REQUEST_TIMEOUT_MS, 
+      },
+      completeChatCache: new GatewayCachePlugin(),
+      getEmbeddingsCache: new GatewayCachePlugin(),
+    });
   }
 
   async runEval({
@@ -202,6 +220,7 @@ class Evaluator {
             logger,
             fetchWithCache,
             getCache,
+            gateway: this.gateway,
           },
           {
             includeLogProbs: test.assert?.some((a) => a.type === 'perplexity'),

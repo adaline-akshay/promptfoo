@@ -1,8 +1,13 @@
 import Anthropic, { APIError } from '@anthropic-ai/sdk';
+import type {
+  CompleteChatHandlerResponseType,
+} from '@adaline/gateway';
+import { Anthropic as GatewayAnthropic } from '@adaline/anthropic';
+
 import { getCache, isCacheEnabled } from '../cache';
 import { getEnvString, getEnvFloat, getEnvInt } from '../envars';
 import logger from '../logger';
-import type { ApiProvider, EnvOverrides, ProviderResponse, TokenUsage } from '../types';
+import type { ApiProvider, EnvOverrides, ProviderResponse, TokenUsage, CallApiContextParams } from '../types';
 import { maybeLoadFromExternalFile } from '../util';
 import { calculateCost } from './shared';
 
@@ -205,69 +210,91 @@ export class AnthropicMessagesProvider implements ApiProvider {
     return `[Anthropic Messages Provider ${this.modelName || 'claude-2.1'}]`;
   }
 
-  async callApi(prompt: string): Promise<ProviderResponse> {
+  // TODO: add debug logging
+  // TODO: remove console.logs
+  async callApi(prompt: string, context?: CallApiContextParams): Promise<ProviderResponse> {
     if (!this.apiKey) {
       throw new Error(
         'Anthropic API key is not set. Set the ANTHROPIC_API_KEY environment variable or add `apiKey` to the provider config.',
       );
     }
 
-    const { system, extractedMessages } = parseMessages(prompt);
-    const params: Anthropic.MessageCreateParams = {
-      model: this.modelName,
-      ...(system ? { system } : {}),
-      max_tokens: this.config?.max_tokens || getEnvInt('ANTHROPIC_MAX_TOKENS', 1024),
-      messages: extractedMessages,
-      stream: false,
-      temperature: this.config.temperature || getEnvFloat('ANTHROPIC_TEMPERATURE', 0),
-      ...(this.config.tools ? { tools: maybeLoadFromExternalFile(this.config.tools) } : {}),
-      ...(this.config.tool_choice ? { tool_choice: this.config.tool_choice } : {}),
-    };
-
-    logger.debug(`Calling Anthropic Messages API: ${JSON.stringify(params)}`);
-
-    const cache = await getCache();
-    const cacheKey = `anthropic:${JSON.stringify(params)}`;
-
-    if (isCacheEnabled()) {
-      // Try to get the cached response
-      const cachedResponse = await cache.get<string | undefined>(cacheKey);
-      if (cachedResponse) {
-        logger.debug(`Returning cached response for ${prompt}: ${cachedResponse}`);
+    try {
+      let response, cached = false;
+      let useGateway = context?.gateway ? true : false;
+      console.log('useGateway', useGateway);
+      if (useGateway) {
         try {
-          const parsedCachedResponse = JSON.parse(cachedResponse) as Anthropic.Messages.Message;
-          return {
-            output: outputFromMessage(parsedCachedResponse),
-            tokenUsage: {},
-          };
-        } catch {
-          // Could be an old cache item, which was just the text content from TextBlock.
-          return {
-            output: cachedResponse,
-            tokenUsage: {},
-          };
+          console.log('calling gateway');
+          const { data, cached: gatewayCached } = await this.callApiGateway(prompt, context);
+          response = data;
+          cached = gatewayCached;
+          console.log('data', data);
+          console.log('cached', cached);
+          // return { data, cached };
+        } catch (err) {
+          console.log('error', JSON.stringify(err, null, 2));
+          useGateway = false; // fallback to calling Anthropic SDK directly
         }
       }
-    }
 
-    try {
-      const response = await this.anthropic.messages.create(params, {
-        ...(this.config.headers ? { headers: this.config.headers } : {}),
-      });
+      if (!useGateway) {
+        const { system, extractedMessages } = parseMessages(prompt);
+        const params: Anthropic.MessageCreateParams = {
+          model: this.modelName,
+          ...(system ? { system } : {}),
+          max_tokens: this.config?.max_tokens || getEnvInt('ANTHROPIC_MAX_TOKENS', 1024),
+          messages: extractedMessages,
+          stream: false,
+          temperature: this.config.temperature || getEnvFloat('ANTHROPIC_TEMPERATURE', 0),
+          ...(this.config.tools ? { tools: maybeLoadFromExternalFile(this.config.tools) } : {}),
+          ...(this.config.tool_choice ? { tool_choice: this.config.tool_choice } : {}),
+        };
 
-      logger.debug(`Anthropic Messages API response: ${JSON.stringify(response)}`);
+        logger.debug(`Calling Anthropic Messages API: ${JSON.stringify(params)}`);
 
-      if (isCacheEnabled()) {
-        try {
-          await cache.set(cacheKey, JSON.stringify(response));
-        } catch (err) {
-          logger.error(`Failed to cache response: ${String(err)}`);
+        const cache = await getCache();
+        const cacheKey = `anthropic:${JSON.stringify(params)}`;
+
+        if (isCacheEnabled()) {
+          // Try to get the cached response
+          const cachedResponse = await cache.get<string | undefined>(cacheKey);
+          if (cachedResponse) {
+            logger.debug(`Returning cached response for ${prompt}: ${cachedResponse}`);
+            try {
+              const parsedCachedResponse = JSON.parse(cachedResponse) as Anthropic.Messages.Message;
+              return {
+                output: outputFromMessage(parsedCachedResponse),
+                tokenUsage: {},
+              };
+            } catch {
+              // Could be an old cache item, which was just the text content from TextBlock.
+              return {
+                output: cachedResponse,
+                tokenUsage: {},
+              };
+            }
+          }
+        }
+
+        response = await this.anthropic.messages.create(params, {
+          ...(this.config.headers ? { headers: this.config.headers } : {}),
+        });
+
+        logger.debug(`Anthropic Messages API response: ${JSON.stringify(response)}`);
+
+        if (isCacheEnabled()) {
+          try {
+            await cache.set(cacheKey, JSON.stringify(response));
+          } catch (err) {
+            logger.error(`Failed to cache response: ${String(err)}`);
+          }
         }
       }
 
       return {
         output: outputFromMessage(response),
-        tokenUsage: getTokenUsage(response, false),
+        tokenUsage: getTokenUsage(response, cached),
         cost: calculateAnthropicCost(
           this.modelName,
           this.config,
@@ -286,6 +313,67 @@ export class AnthropicMessagesProvider implements ApiProvider {
       return {
         error: `API call error: ${String(err)}`,
       };
+    }
+  }
+
+  // TODO: add debug logging
+  // TODO: remove console.logs
+  async callApiGateway(
+    prompt: string,
+    context?: CallApiContextParams,
+  ): Promise<{ data: any; cached: boolean }> {
+    try {
+      const gatewayAnthropic = new GatewayAnthropic();
+      // TODO: include config.model 
+      if (!gatewayAnthropic.chatModelLiterals().includes(this.modelName)) {
+        throw new Error(`Unsupported Gateway Groq chat model: ${this.modelName}`);
+      }
+
+      const gatewayModel = gatewayAnthropic.chatModel({
+        modelName: this.modelName,
+        apiKey: this.apiKey as string,
+      });
+
+      const { system, extractedMessages } = parseMessages(prompt);
+      const params: Anthropic.MessageCreateParams = {
+        model: this.modelName,
+        ...(system ? { system } : {}),
+        max_tokens: this.config?.max_tokens || getEnvInt('ANTHROPIC_MAX_TOKENS', 1024),
+        messages: extractedMessages,
+        temperature: this.config.temperature || getEnvFloat('ANTHROPIC_TEMPERATURE', 0),
+        ...(this.config.tools ? { tools: maybeLoadFromExternalFile(this.config.tools) } : {}),
+        ...(this.config.tool_choice ? { tool_choice: this.config.tool_choice } : {}),
+      };
+
+      const modelRequest = {
+        ...params,
+      };
+      console.log('modelRequest', modelRequest);
+
+      const _gatewayRequest = gatewayModel.transformModelRequest(modelRequest);
+      console.log('_gatewayRequest', JSON.stringify(_gatewayRequest, null, 2));
+
+      const gatewayRequest = {
+        model: gatewayModel,
+        config: _gatewayRequest.config,
+        messages: _gatewayRequest.messages,
+        tools: _gatewayRequest.tools,
+        options: {
+          enableCache: isCacheEnabled(),
+        },
+      };
+
+      logger.debug(`Calling Anthropic Chat Completion via Gateway: ${JSON.stringify(gatewayRequest)}`);
+      const response = (await context?.gateway?.completeChat(
+        gatewayRequest,
+      )) as CompleteChatHandlerResponseType;
+      logger.debug(`Anthropic Chat Completion via Gateway response: ${JSON.stringify(response)}`);
+      const gatewayResponse = response.provider.response.data;
+
+      return { data: gatewayResponse, cached: response.cached };
+    } catch (err) {
+      logger.debug(`Error calling Anthropic Chat Completion via Gateway: ${err}`);
+      throw new Error(`Error calling Anthropic Chat Completion via Gateway: ${err}`);
     }
   }
 }
